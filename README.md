@@ -5,11 +5,53 @@ Rename scientific PDFs as `JournalAbbrev_AuthorYear_ShortTitle.pdf`.
 Scans `~/Papers/Inbox` by default and moves successfully renamed PDFs to
 `~/Papers/Renamed`, keeping the inbox as an intake queue.
 
+## Workflow
+
+The script is designed to be a **pre-Zotero filter** — handle the flood of
+temporary PDFs without polluting your reference manager:
+
+```
+Downloads / browser downloads
+  │
+  ▼
+~/Papers/Inbox          ←  dump everything here
+  │
+  │  renamepapers        ←  auto-identify & rename
+  ▼
+~/Papers/Renamed         ←  clean, searchable filenames
+  │
+  ├─ important  ──→  Zotero  (Rename and Move)
+  ├─ maybe       ──→  keep in Renamed
+  └─ junk        ──→  delete
+```
+
+**Why this works**: Zotero stays clean — only curated references enter your
+library. Temporary PDFs, preprints you're skimming, and papers you might not
+keep don't clutter Zotero. But they still get human-readable filenames so you
+can find them later with Spotlight / Finder / fzf.
+
+### Daily usage
+
+```bash
+# 1. Download PDFs → ~/Papers/Inbox (browser default, or drag from Downloads)
+# 2. Run the script
+renamepapers
+
+# 3. Skim failures, fix manually if needed
+renamepapers --title "..." --author "..." --year 2024 failed.pdf
+
+# 4. Important papers → Zotero; rest → keep or delete
+```
+
 ## Install
 
 ```bash
-# Requires Python 3.10+ and optionally pdftotext (poppler) for best results.
-brew install poppler          # recommended — enables PDF text extraction
+# Requires Python 3.10+.  Install pdftotext for best results:
+brew install poppler
+
+# One-line install:
+./install_renamepapers.sh
+#   … or manually …
 cp renamepapers.py ~/.local/bin/renamepapers
 chmod +x ~/.local/bin/renamepapers
 ```
