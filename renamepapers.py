@@ -9,12 +9,14 @@ default so ~/Papers/Inbox stays as the intake queue.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,7 +26,7 @@ from typing import Any
 
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 SPACE_RE = re.compile(r"\s+")
-WORD_RE = re.compile(r"[A-Za-z0-9]+")
+WORD_RE = re.compile(r"[^\W_]+")  # Unicode letters + digits, excluding underscore
 RENAMED_FILE_RE = re.compile(
     r"^(?:Book|BookChapter|[A-Z][A-Za-z0-9]{1,12})[-_][A-Za-z][A-Za-z0-9]*"
     r"(?:19|20)\d{2}[-_][A-Za-z0-9][A-Za-z0-9_]*(?:_supplement)?$"
@@ -65,7 +67,10 @@ JOURNAL_ALIASES = {
     "journal of global optimization": "JGO",
     "journal of optimization theory and applications": "JOTA",
     "management science": "MS",
+    "m and som": "MSOM",
+    "m som": "MSOM",
     "manufacturing and service operations management": "MSOM",
+    "manufacturing service operations management": "MSOM",
     "mathematics of operations research": "MOR",
     "mathematics of or": "MOR",
     "math oper res": "MOR",
@@ -76,8 +81,28 @@ JOURNAL_ALIASES = {
     "production and operations management": "POM",
     "siam journal on computing": "SICOMP",
     "siam journal on discrete mathematics": "SIDMA",
+    "siam journal on applied mathematics": "SIAP",
     "siam journal on optimization": "SIOPT",
     "transportation science": "TS",
+    # Self-aliases: parsed abbreviation → same abbreviation.
+    "aor": "AOR",
+    "ejor": "EJOR",
+    "ijaa": "IJAA",
+    "ijoc": "IJOC",
+    "joco": "JOCO",
+    "jgo": "JGO",
+    "jota": "JOTA",
+    "ms": "MS",
+    "msom": "MSOM",
+    "mor": "MOR",
+    "nrl": "NRL",
+    "or": "OR",
+    "orl": "ORL",
+    "pom": "POM",
+    "sicomp": "SICOMP",
+    "sidma": "SIDMA",
+    "siopt": "SIOPT",
+    "ts": "TS",
 }
 
 
@@ -204,12 +229,23 @@ def process_pdf(
             metadata = crossref_by_isbn(isbn, mailto)
 
     if metadata is None and text.strip():
+        metadata = handbook_chapter_metadata_from_text(text)
+
+    if metadata is None and text.strip():
+        metadata = article_metadata_from_text(text)
+
+    if metadata is None and text.strip():
+        metadata = book_metadata_from_text(text)
+
+    if metadata is None and text.strip():
         title_guess = guess_title(text)
         if title_guess:
             author_guess = guess_author(text)
             metadata = crossref_by_title(
                 title_guess, mailto, author=author_guess
             )
+            if metadata and crossref_result_conflicts_with_journal_text(metadata, text):
+                metadata = None
 
     if metadata is None:
         if pdf_metadata:
@@ -222,12 +258,18 @@ def process_pdf(
                 if candidate and titles_match(
                     pdf_title,
                     first_value(candidate.get("title")) or "",
-                ):
+                ) and not crossref_result_conflicts_with_journal_text(candidate, text):
                     metadata = candidate
             # Only fall back to bare pdf_metadata when the PDF also
-            # carries author / DOI info that gives us confidence.
+            # carries author / DOI info, or the embedded title is confirmed
+            # by first-page text and can be enriched from the masthead.
             if metadata is None:
-                if pdf_metadata.get("author") or pdf_metadata.get("DOI"):
+                enrich_metadata_from_text(pdf_metadata, text)
+                if (
+                    pdf_metadata.get("author")
+                    or pdf_metadata.get("DOI")
+                    or metadata_title_appears_in_text(pdf_metadata, text)
+                ):
                     metadata = pdf_metadata
                 elif not title:
                     raise ValueError(
@@ -242,6 +284,8 @@ def process_pdf(
         elif is_already_renamed(pdf):
             new_name = pdf.name
             destination = (pdf.parent if in_place else outbox) / new_name
+            if in_place and destination.resolve() == pdf.resolve():
+                return f"OK  {pdf.name} -> {destination}"
             destination = unique_path(destination)
             if dry_run:
                 return f"DRY {pdf.name} -> {destination}"
@@ -272,9 +316,16 @@ def process_pdf(
         if inferred_kind == "book" and not first_value(metadata.get("title"))
         else None
     )
+    suffix = supplement_suffix(pdf, metadata, text)
+    if suffix:
+        resolved = resolve_supplement_metadata(metadata, pdf, text, outbox, mailto)
+        if resolved:
+            metadata = resolved
+            _book_year = None
+            title_override = None
     new_name = build_filename(
         metadata,
-        suffix=supplement_suffix(pdf, metadata, text),
+        suffix=suffix,
         kind=inferred_kind,
         title_override=title_override,
         year_override=year or _book_year,
@@ -463,11 +514,18 @@ def first_regex(raw: str, patterns: tuple[str, ...]) -> str | None:
 
 def clean_pdf_literal(value: str) -> str:
     value = value.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+    value = re.sub(r"&#x\\?\s*([0-9A-Fa-f]+);", r"&#x\1;", value)
+    value = re.sub(r"&#\\?\s*([0-9]+);", r"&#\1;", value)
+    value = html.unescape(value)
+    value = value.replace("\u2013", " - ").replace("\u2014", " - ")
     value = re.sub(r"<[^>]+>", " ", value)
     return SPACE_RE.sub(" ", value).strip()
 
 
 def is_generic_pdf_title(value: str) -> bool:
+    lowered = value.lower().strip()
+    if lowered.endswith((".eps", ".ps", ".ai")) or "logo" in lowered:
+        return True
     return normalize_journal(value) in {
         "bibliography",
         "contents",
@@ -592,7 +650,7 @@ def guess_title(text: str) -> str | None:
     text = re.sub(r"[\x0b\x0c\x1c\x1d\x1e]", " ", text)
     lines = []
     for raw_line in text.splitlines()[:80]:
-        line = SPACE_RE.sub(" ", raw_line).strip()
+        line = collapse_spaced_letters(SPACE_RE.sub(" ", raw_line).strip())
         if not line:
             continue
         lower = line.lower()
@@ -612,6 +670,16 @@ def guess_title(text: str) -> str | None:
             line,
         ):
             continue  # e.g. "Mathematical Programming (2013) 141:507–526"
+        if re.match(
+            r"^[A-Z][A-Za-z& ]{2,80}\s+\d+\s*\((?:19|20)\d{2}\)\s+\d+[\-–]\d+\.?$",
+            line,
+        ):
+            continue  # e.g. "Mathematical Programming 14 (1978) 265-294."
+        if re.search(
+            r"\b(?:north-holland|publishing company|springer|elsevier)\b",
+            lower,
+        ):
+            continue
         # Accept titles as short as 10 chars (e.g. "Integer Programming" = 19).
         if len(line) < 10 or len(line) > 250:
             continue
@@ -722,12 +790,13 @@ def crossref_by_title(
     results and return the first whose author list contains *author*."""
     params = {
         "query.title": title,
-        "rows": "5" if author else "1",
+        "rows": "5",
         "select": ",".join(
             (
                 "DOI",
                 "title",
                 "author",
+                "editor",
                 "issued",
                 "published-print",
                 "published-online",
@@ -736,6 +805,7 @@ def crossref_by_title(
                 "type",
                 "ISBN",
                 "publisher",
+                "relation",
             )
         ),
     }
@@ -745,18 +815,406 @@ def crossref_by_title(
     items = payload.get("message", {}).get("items", []) if payload else []
     if not items:
         return None
+    title_matches = [
+        item for item in items
+        if titles_match(title, first_value(item.get("title")) or "")
+    ]
+    if not title_matches:
+        return None
     if author:
         # Filter to the first result that includes *author*.
         author_lower = author.lower()
-        for item in items:
+        for item in title_matches:
             for a in item.get("author") or []:
                 family = (a.get("family") or "").lower()
                 given = (a.get("given") or "").lower()
                 if author_lower in family or author_lower in given:
                     return item
-        # No author match — fall back to first result anyway.
-        return items[0]
-    return items[0]
+    return title_matches[0]
+
+
+def enrich_metadata_from_text(metadata: dict[str, Any], text: str) -> None:
+    """Fill missing PDF metadata from a first-page journal masthead."""
+    match = journal_masthead_match(text)
+    if match:
+        metadata.setdefault(
+            "container-title",
+            [SPACE_RE.sub(" ", match.group(1)).strip()],
+        )
+        metadata.setdefault("issued", {"date-parts": [[int(match.group(2))]]})
+
+    if "author" not in metadata:
+        author = guess_author(text)
+        if author:
+            metadata["author"] = [{"family": author}]
+
+
+def metadata_title_appears_in_text(metadata: dict[str, Any], text: str) -> bool:
+    title = first_value(metadata.get("title")) or ""
+    if not title:
+        return False
+    title_words = {w.lower() for w in WORD_RE.findall(title) if len(w) >= 3}
+    text_words = {w.lower() for w in WORD_RE.findall(text[:5000]) if len(w) >= 3}
+    if not title_words:
+        return False
+    return len(title_words & text_words) / len(title_words) >= 0.6
+
+
+def article_metadata_from_text(text: str) -> dict[str, Any] | None:
+    if jstor_meta := jstor_article_metadata_from_text(text):
+        return jstor_meta
+    if siam_meta := siam_article_metadata_from_text(text):
+        return siam_meta
+    if not looks_like_journal_article_text(text):
+        return None
+    first_page = text.split("\f", 1)[0]
+    lines = [
+        SPACE_RE.sub(" ", line).strip()
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+    title = journal_article_title_from_lines(lines)
+    if not title:
+        return None
+
+    metadata: dict[str, Any] = {
+        "title": [title],
+        "type": "journal-article",
+    }
+    if doi := find_doi(first_page):
+        metadata["DOI"] = doi
+    if journal := journal_name_from_article_lines(lines):
+        metadata["container-title"] = [journal]
+    if year := article_year_from_text(first_page):
+        metadata["issued"] = {"date-parts": [[int(year)]]}
+    if author := journal_article_author_from_lines(lines, title):
+        metadata["author"] = [{"family": author}]
+    return metadata
+
+
+def handbook_chapter_metadata_from_text(text: str) -> dict[str, Any] | None:
+    first_page = text.split("\f", 1)[0]
+    if "Handbooks in OR & MS" not in first_page[:2000]:
+        return None
+
+    lines = [
+        SPACE_RE.sub(" ", line).strip()
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+    title = None
+    for i, line in enumerate(lines):
+        if re.match(r"^Chapter\s+\d+\b", line, flags=re.IGNORECASE):
+            for candidate in lines[i + 1 : i + 5]:
+                if len(WORD_RE.findall(candidate)) >= 2:
+                    title = candidate
+                    break
+            break
+    if not title:
+        return None
+
+    metadata: dict[str, Any] = {
+        "title": [title],
+        "type": "book-chapter",
+    }
+
+    if year_match := re.search(r"\b((?:19|20)\d{2})\b", first_page[:1000]):
+        metadata["issued"] = {"date-parts": [[int(year_match.group(1))]]}
+
+    if doi := find_doi(first_page):
+        metadata["DOI"] = doi
+
+    title_seen = False
+    for line in lines:
+        if line == title:
+            title_seen = True
+            continue
+        if not title_seen:
+            continue
+        if re.search(r"\b(?:Abstract|De|Institut|Department|University|E-mail)\b", line):
+            continue
+        words = WORD_RE.findall(line)
+        if 2 <= len(words) <= 5 and any(ch.islower() for ch in line):
+            metadata["author"] = [{"family": words[-1]}]
+            break
+
+    return metadata
+
+
+def siam_article_metadata_from_text(text: str) -> dict[str, Any] | None:
+    first_page = text.split("\f", 1)[0]
+    if "SIAM J." not in first_page[:3000]:
+        return None
+
+    lines = [
+        collapse_spaced_letters(SPACE_RE.sub(" ", line).strip())
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+    head = "\n".join(lines[:30])
+
+    journal = None
+    if re.search(r"SIAM J\.?\s+ALG\.?\s+DISC\.?\s+METH\.?", head, re.IGNORECASE):
+        journal = "SIAM Journal on Algebraic and Discrete Methods"
+    elif re.search(r"SIAM J\..{0,20}MATH", head, re.IGNORECASE):
+        journal = "SIAM Journal on Applied Mathematics"
+    elif match := re.search(r"(SIAM J\.[^\n]+)", head):
+        journal = match.group(1)
+
+    year_match = re.search(r"\b((?:19|20)\d{2})\b", head)
+
+    title_lines: list[str] = []
+    for line in lines[:40]:
+        lower = line.lower()
+        if (
+            "siam j." in lower
+            or "society for industrial" in lower
+            or lower.startswith(("vol.", "downloaded "))
+            or re.fullmatch(r"\d{3,}", line)
+        ):
+            continue
+        if title_lines and looks_like_author_line(line):
+            break
+        if title_lines and lower.startswith("abstract"):
+            break
+        if (
+            sum(ch.isalpha() for ch in line) >= 10
+            and len(WORD_RE.findall(line)) >= 3
+            and line.upper() == line
+        ):
+            title_lines.append(line.rstrip("*"))
+            continue
+        if title_lines:
+            break
+
+    title = " ".join(title_lines).title().strip()
+    if not title:
+        return None
+
+    metadata: dict[str, Any] = {
+        "title": [title],
+        "type": "journal-article",
+    }
+    if journal:
+        metadata["container-title"] = [journal]
+    if year_match:
+        metadata["issued"] = {"date-parts": [[int(year_match.group(1))]]}
+
+    title_seen = False
+    for line in lines[:50]:
+        lower = line.lower()
+        if title_lines and line.rstrip("*") == title_lines[-1]:
+            title_seen = True
+            continue
+        if not title_seen:
+            continue
+        if (
+            "society for industrial" in lower
+            or lower.startswith(("abstract", "downloaded", "vol."))
+        ):
+            continue
+        cleaned_line = normalize_ocr_author_line(line)
+        words = WORD_RE.findall(cleaned_line)
+        if (
+            2 <= len(words) <= 5
+            and all(word.isupper() or len(word) == 1 for word in words)
+        ):
+            metadata["author"] = [{"family": surname_from_author_line(cleaned_line)}]
+            break
+        if looks_like_author_line(line):
+            if words:
+                metadata["author"] = [{"family": surname_from_author_line(cleaned_line)}]
+                break
+
+    return metadata
+
+
+def normalize_ocr_author_line(line: str) -> str:
+    line = line.replace('"', " ")
+    line = re.sub(r"\bAN[ti]\)?\b", " and ", line, flags=re.IGNORECASE)
+    line = re.sub(r"[^A-Za-z.\s-]", " ", line)
+    return SPACE_RE.sub(" ", line).strip()
+
+
+def surname_from_author_line(line: str) -> str:
+    first = re.split(r"\s+and\s+|,", line, maxsplit=1, flags=re.IGNORECASE)[0]
+    words = [w for w in WORD_RE.findall(first) if len(w) > 1]
+    if len(words) >= 2 and words[-2].lower() in {"van", "von", "de", "da", "le"}:
+        return format_word(words[-2]) + format_word(words[-1])
+    return words[-1] if words else ""
+
+
+
+def jstor_article_metadata_from_text(text: str) -> dict[str, Any] | None:
+    first_page = text.split("\f", 1)[0]
+    lines = [
+        SPACE_RE.sub(" ", line).strip()
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+    if not any("jstor.org/stable/" in line.lower() for line in lines):
+        return None
+
+    title = None
+    author_line = None
+    source_line = None
+    for line in lines[:30]:
+        lower = line.lower()
+        if lower.startswith("author(s):"):
+            author_line = line
+        elif lower.startswith("source:"):
+            source_line = line
+        elif title is None and not lower.startswith(("author(s):", "source:")):
+            title = line
+
+    if not title or not source_line:
+        return None
+
+    metadata: dict[str, Any] = {
+        "title": [title],
+        "type": "journal-article",
+    }
+
+    source = re.sub(r"^Source:\s*", "", source_line, flags=re.IGNORECASE)
+    journal = source.split(",", 1)[0].strip()
+    if journal:
+        metadata["container-title"] = [journal]
+
+    year_match = re.search(r"\b((?:19|20)\d{2})\b", source)
+    if year_match:
+        metadata["issued"] = {"date-parts": [[int(year_match.group(1))]]}
+
+    if author_line:
+        authors = re.sub(r"^Author\(s\):\s*", "", author_line, flags=re.IGNORECASE)
+        first = re.split(r",|\s+and\s+", authors, maxsplit=1)[0]
+        words = WORD_RE.findall(first)
+        if words:
+            metadata["author"] = [{"family": words[-1]}]
+
+    return metadata
+
+
+def looks_like_journal_article_text(text: str) -> bool:
+    head = text[:5000]
+    lower = head.lower()
+    return bool(
+        find_doi(head)
+        and (
+            journal_masthead_match(head)
+            or re.search(r"\bvol\.\s*\d+,\s*no\.\s*\d+", lower)
+            or re.search(r"\bissn\b.*\beissn\b", lower)
+        )
+    )
+
+
+def journal_name_from_article_lines(lines: list[str]) -> str | None:
+    head_lines: list[str] = []
+    for line in lines[:10]:
+        lower = line.lower()
+        if lower.startswith("vol.") or "doi " in lower or "issn" in lower:
+            break
+        cleaned = re.sub(r"\binforms\b|®", "", line, flags=re.IGNORECASE)
+        if cleaned.strip():
+            head_lines.append(cleaned.strip())
+    if not head_lines:
+        return None
+    journal = SPACE_RE.sub(" ", " ".join(head_lines)).strip()
+    return journal.title().replace("&", "and")
+
+
+def article_year_from_text(text: str) -> str | None:
+    head = text[:5000]
+    for pattern in (
+        r"\b(?:Spring|Summer|Fall|Winter)\s+((?:19|20)\d{2})\b",
+        r"©\s*((?:19|20)\d{2})\b",
+        r"\b(?:19|20)\d{2}\s+INFORMS\b",
+    ):
+        match = re.search(pattern, head, flags=re.IGNORECASE)
+        if match:
+            return match.group(1) if match.lastindex else match.group(0)[:4]
+    return None
+
+
+def journal_article_title_from_lines(lines: list[str]) -> str | None:
+    start = None
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if "issn" in lower or "doi " in lower or lower.startswith("vol."):
+            start = i + 1
+    if start is None:
+        return None
+
+    title_lines: list[str] = []
+    for line in lines[start:]:
+        lower = line.lower()
+        if not title_lines and (
+            lower.startswith(("issn", "eissn"))
+            or "©" in line
+            or "informs" in lower
+        ):
+            continue
+        if looks_like_author_line(line):
+            break
+        if re.search(r"\b(?:school|department|university|institute)\b", lower):
+            break
+        if "@" in line or line.startswith("{"):
+            break
+        if 2 <= len(WORD_RE.findall(line)) <= 14:
+            title_lines.append(line)
+            continue
+        if title_lines:
+            break
+
+    title = " ".join(title_lines).strip()
+    if 10 <= len(title) <= 250:
+        return title
+    return None
+
+
+def journal_article_author_from_lines(lines: list[str], title: str) -> str | None:
+    title_words = set(WORD_RE.findall(title.lower()))
+    for line in lines:
+        lower = line.lower()
+        if (
+            lower.startswith(("vol.", "issn", "eissn"))
+            or "doi " in lower
+            or "©" in line
+        ):
+            continue
+        if title_words and len(title_words & set(WORD_RE.findall(line.lower()))) >= 2:
+            continue
+        if looks_like_author_line(line):
+            words = WORD_RE.findall(line.split(",")[0])
+            if words:
+                return words[-1]
+    return None
+
+
+def journal_masthead_match(text: str) -> re.Match[str] | None:
+    head = "\n".join(text.splitlines()[:40])
+    return re.search(
+        r"(?m)^([A-Z][A-Za-z& ]{2,80})\s+\d+\s*\(((?:19|20)\d{2})\)\s+\d+[\-–]\d+\.?$",
+        head,
+    )
+
+
+def crossref_result_conflicts_with_journal_text(
+    metadata: dict[str, Any],
+    text: str,
+) -> bool:
+    item_type = str(metadata.get("type") or "").lower()
+    if item_type not in {
+        "book",
+        "monograph",
+        "reference-book",
+        "book-series",
+        "book-chapter",
+        "book-part",
+        "reference-entry",
+        "book-section",
+    }:
+        return False
+    return journal_masthead_match(text) is not None
 
 
 def guess_author(text: str) -> str | None:
@@ -767,7 +1225,7 @@ def guess_author(text: str) -> str | None:
     """
     text = re.sub(r"[\x0b\x0c\x1c\x1d\x1e]", " ", text)
     lines = [
-        SPACE_RE.sub(" ", ln).strip()
+        collapse_spaced_letters(SPACE_RE.sub(" ", ln).strip())
         for ln in text.splitlines()[:40]
     ]
     # Find the first author-like line after the first few lines.
@@ -777,7 +1235,8 @@ def guess_author(text: str) -> str | None:
         # Author line with initial: "Laurence A. Wolsey"
         if re.search(r"\b[A-Z]\.(?:\s+[A-Z]|$)", line):
             # Return the surname (last word).
-            words = WORD_RE.findall(line)
+            first_author_part = re.split(r"\s+and\s+|,", line, maxsplit=1)[0]
+            words = WORD_RE.findall(first_author_part)
             if words:
                 return words[-1]
         # Comma-separated: "Smith, J., Jones, P."
@@ -786,6 +1245,15 @@ def guess_author(text: str) -> str | None:
             if words:
                 return words[0]
     return None
+
+
+def collapse_spaced_letters(value: str) -> str:
+    """Collapse OCR text like ``N E M H A U S E R`` into ``NEMHAUSER``."""
+    return re.sub(
+        r"\b(?:[A-Z]\s+){2,}[A-Z]\b",
+        lambda match: match.group(0).replace(" ", ""),
+        value,
+    )
 
 
 def fetch_json(url: str, mailto: str) -> dict[str, Any] | None:
@@ -928,7 +1396,7 @@ def book_title_guess(text: str) -> str | None:
 
 
 def book_year_guess(text: str) -> str | None:
-    head = "\n".join(text.splitlines()[:100])
+    head = text[:20_000]
     candidates = [
         int(match.group(0))
         for match in re.finditer(r"\b(?:19|20)\d{2}\b", head)
@@ -942,13 +1410,270 @@ def book_year_guess(text: str) -> str | None:
     return str(max(candidates))
 
 
+def book_metadata_from_text(text: str) -> dict[str, Any] | None:
+    """Build minimal book metadata from front matter when online lookup fails."""
+    isbn = find_isbn(text)
+    doi = find_doi(text)
+    bookish_doi = bool(doi and re.search(r"/978-?\d", doi))
+    if not (isbn or bookish_doi or has_book_front_matter(text)):
+        return None
+
+    title = springer_book_title(text) or book_title_guess(text)
+    if not title:
+        return None
+
+    metadata: dict[str, Any] = {
+        "title": [title],
+        "type": "book",
+    }
+    if doi:
+        metadata["DOI"] = doi
+    if isbn:
+        metadata["ISBN"] = [isbn]
+
+    editors = springer_book_editors(text)
+    if editors:
+        metadata["editor"] = [{"family": editor} for editor in editors]
+
+    year = book_year_guess(text)
+    if year:
+        metadata["issued"] = {"date-parts": [[int(year)]]}
+
+    if "springer" in text[:20_000].lower():
+        metadata["publisher"] = "Springer"
+
+    return metadata
+
+
+def has_book_front_matter(text: str) -> bool:
+    head = text[:20_000].lower()
+    return bool(
+        re.search(r"\bisbn(?:-1[03])?\b", head)
+        or re.search(r"(?m)^\s*(?:edited by|[A-Z][A-Za-z.\s]+ editors?)\s*$", text[:5000])
+        or "international series in" in head
+        or "this springer imprint" in head
+        or "this book series" in head
+    )
+
+
+def springer_book_title(text: str) -> str | None:
+    pages = text.split("\f", 1)
+    first_page = pages[0] if pages else text
+    lines = [
+        SPACE_RE.sub(" ", line).strip()
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+    if not lines:
+        return None
+
+    start = None
+    for i, line in enumerate(lines):
+        if re.search(r"\bEditors?\b", line):
+            start = i + 1
+            break
+    if start is None:
+        return None
+
+    title_lines: list[str] = []
+    for line in lines[start:]:
+        lowered = line.lower()
+        if lowered.startswith(("volume ", "series editor", "founding editor")):
+            break
+        if re.search(r"\b(?:department|faculty|university|isbn|issn|doi)\b", lowered):
+            break
+        if 1 <= len(WORD_RE.findall(line)) <= 8:
+            title_lines.append(line)
+
+    title = " ".join(title_lines).strip()
+    if 10 <= len(title) <= 180:
+        return title
+    return None
+
+
+def springer_book_editors(text: str) -> list[str]:
+    first_page = text.split("\f", 1)[0]
+    lines = [
+        SPACE_RE.sub(" ", line).strip()
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+    editors: list[str] = []
+    for i, line in enumerate(lines):
+        if not re.search(r"\bEditors?\b", line):
+            continue
+        current = re.sub(r"\bEditors?\b", "", line).strip()
+        candidates = []
+        if i > 0:
+            candidates.append(lines[i - 1])
+        if current:
+            candidates.append(current)
+        for candidate in candidates:
+            if looks_like_person_name(candidate):
+                words = WORD_RE.findall(candidate)
+                if words:
+                    editors.append(words[-1])
+        break
+    return editors
+
+
+def looks_like_person_name(value: str) -> bool:
+    if any(token in value.lower() for token in ("university", "department", "series")):
+        return False
+    words = WORD_RE.findall(value)
+    return 2 <= len(words) <= 5 and any(len(word) == 1 for word in words[:-1])
+
+
 def supplement_suffix(pdf: Path, metadata: dict[str, Any], text: str) -> str:
+    if looks_like_journal_article_text(text) or jstor_article_metadata_from_text(text):
+        return ""
     title = first_value(metadata.get("title")) or ""
     search_text = "\n".join((pdf.stem, title, text[:10_000]))
     search_text = re.sub(r"[_\-.]+", " ", search_text)
     if SUPPLEMENT_RE.search(search_text):
         return "_supplement"
     return ""
+
+
+def _supplement_to_doi(metadata: dict[str, Any]) -> str | None:
+    """Return the main paper's DOI from a supplement's Crossref ``relation``."""
+    relations = metadata.get("relation") or {}
+    if not isinstance(relations, dict):
+        return None
+    for rel_type in ("is-supplement-to", "is-part-of"):
+        items = relations.get(rel_type) or []
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and item.get("id-type") == "doi":
+                    return item.get("id")
+    return None
+
+
+_SUPP_REF_RE = re.compile(
+    r"(?:"
+    r"supplementary\s+material\s+(?:for|to)[:\s]*|"
+    r"online\s+supplement\s+(?:for|to)[:\s]*|"
+    r"supplement(?:ary)?\s+(?:for|to)[:\s]*|"
+    r"appendi(?:x|ces)\s+to[:\s]*"
+    r")"
+    r"([^\n]{15,250})",
+    re.IGNORECASE,
+)
+
+
+def _extract_main_title_from_supplement(text: str) -> str | None:
+    """Extract the main paper's title from supplement text.
+
+    Looks for patterns like "Supplementary Material for: <title>".
+    """
+    match = _SUPP_REF_RE.search(text)
+    if not match:
+        return None
+    candidate = match.group(1).strip().strip('"\'')
+    # Stop at line end, then clean trailing punctuation.
+    candidate = candidate.split("\n")[0].strip()
+    if candidate.endswith(".") and not re.search(r"\b[A-Z]\.$", candidate):
+        candidate = candidate[:-1].strip()
+    if 10 <= len(candidate) <= 250:
+        return candidate
+    return None
+
+
+def _parse_renamed_stem(stem: str) -> dict[str, Any] | None:
+    """Parse a renamed file stem back into Crossref-style metadata.
+
+    Format: ``Journal-AuthorYear-ShortTitle`` (``_supplement`` suffix
+    is stripped first).
+    """
+    stem = re.sub(r"_supplement$", "", stem)
+    parts = stem.split("-", 2)
+    if len(parts) < 3:
+        return None
+    journal, author_year, short_title = parts
+    match = re.match(r"^([A-Za-z][A-Za-z0-9]*?)((?:19|20)\d{2})$", author_year)
+    if not match:
+        return None
+    return {
+        "short-container-title": [journal],
+        "author": [{"family": match.group(1)}],
+        "issued": {"date-parts": [[int(match.group(2))]]},
+        "title": [short_title.replace("_", " ")],
+    }
+
+
+def _find_main_in_outbox(
+    supp_metadata: dict[str, Any],
+    outbox: Path,
+) -> dict[str, Any] | None:
+    """Find a matching main paper in *outbox* by title word overlap."""
+    if not outbox.exists():
+        return None
+    supp_title = first_value(supp_metadata.get("title")) or ""
+    supp_words = {
+        w.lower() for w in WORD_RE.findall(supp_title) if len(w) >= 2
+    }
+    if len(supp_words) < 2:
+        return None
+
+    best_score = 0.0
+    best_stem: str | None = None
+
+    for f in outbox.glob("*.pdf"):
+        stem = f.stem
+        if stem.endswith("_supplement"):
+            continue  # skip other supplements
+        m = re.match(r"^[A-Za-z0-9]+-[A-Za-z][A-Za-z0-9]*\d{4}-(.+)$", stem)
+        if not m:
+            continue
+        file_title = m.group(1)
+        file_words = {
+            w.lower() for w in WORD_RE.findall(file_title) if len(w) >= 2
+        }
+        if not file_words:
+            continue
+        overlap = supp_words & file_words
+        score = len(overlap) / min(len(supp_words), len(file_words))
+        if score > best_score:
+            best_score = score
+            best_stem = stem
+
+    if best_score >= 0.5 and best_stem:
+        return _parse_renamed_stem(best_stem)
+    return None
+
+
+def resolve_supplement_metadata(
+    metadata: dict[str, Any],
+    pdf: Path,
+    text: str,
+    outbox: Path,
+    mailto: str,
+) -> dict[str, Any] | None:
+    """Try to find the main paper that *pdf* supplements.
+
+    Returns the main paper's metadata when found so the supplement can
+    share the same journal / author / year / title stem.
+    """
+    # Strategy 1: Crossref ``is-supplement-to`` relation → fetch main paper.
+    main_doi = _supplement_to_doi(metadata)
+    if main_doi:
+        main_meta = crossref_by_doi(main_doi, mailto)
+        if main_meta:
+            return main_meta
+
+    # Strategy 2: extract main-paper title from text → Crossref lookup.
+    main_title = _extract_main_title_from_supplement(text)
+    if main_title:
+        main_meta = crossref_by_title(main_title, mailto)
+        if main_meta:
+            return main_meta
+
+    # Strategy 3: compare with already-renamed files in the outbox.
+    outbox_match = _find_main_in_outbox(metadata, outbox)
+    if outbox_match:
+        return outbox_match
+
+    return None
 
 
 def journal_abbrev(metadata: dict[str, Any]) -> str | None:
@@ -977,6 +1702,7 @@ def journal_alias(value: str) -> str | None:
 
 
 def normalize_journal(value: str) -> str:
+    value = html.unescape(value)
     value = value.replace("&", " and ")
     value = re.sub(r"[^A-Za-z0-9]+", " ", value).lower()
     return SPACE_RE.sub(" ", value).strip()
@@ -998,10 +1724,10 @@ def journal_initials(value: str) -> str | None:
 
 
 def first_author(metadata: dict[str, Any]) -> str | None:
-    authors = metadata.get("author") or []
-    if not authors:
+    contributors = metadata.get("author") or metadata.get("editor") or []
+    if not contributors:
         return None
-    first = authors[0]
+    first = contributors[0]
     name = first.get("family") or first.get("name") or first.get("given")
     if not name:
         return None
@@ -1009,7 +1735,7 @@ def first_author(metadata: dict[str, Any]) -> str | None:
 
 
 def publication_year(metadata: dict[str, Any]) -> str | None:
-    for key in ("issued", "published-print", "published-online"):
+    for key in ("published-print", "issued", "published-online"):
         date_parts = metadata.get(key, {}).get("date-parts")
         if date_parts and date_parts[0]:
             return str(date_parts[0][0])
@@ -1024,12 +1750,12 @@ def clean_year(value: str | None) -> str | None:
 
 
 def shorten_title(title: str, max_chars: int = 80) -> str:
-    words = WORD_RE.findall(title)
+    words = WORD_RE.findall(ascii_fold(title))
     kept: list[str] = []
     for word in words:
         if not any(ch.isalnum() for ch in word):
             continue
-        kept.append(word[:1].upper() + word[1:])
+        kept.append(format_word(word))
 
     compact = "_".join(kept) or "Untitled"
     return compact[:max_chars].rstrip("_-")
@@ -1044,13 +1770,26 @@ def first_value(value: Any) -> str | None:
 
 
 def clean_journal(value: str) -> str:
-    words = WORD_RE.findall(value)
-    return "".join(word[:1].upper() + word[1:] for word in words)[:32]
+    words = WORD_RE.findall(ascii_fold(value))
+    return "".join(format_word(word) for word in words)[:32]
+
+
+def ascii_fold(value: str) -> str:
+    """Normalize Unicode diacritics to ASCII equivalents (e.g. 'ć' → 'c')."""
+    normalized = unicodedata.normalize("NFKD", value)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
 
 
 def clean_token(value: str, max_words: int) -> str:
+    value = ascii_fold(value)
     words = WORD_RE.findall(value)[:max_words]
-    return "".join(word[:1].upper() + word[1:] for word in words)
+    return "".join(format_word(word) for word in words)
+
+
+def format_word(word: str) -> str:
+    if len(word) > 1 and word.isupper():
+        word = word.lower()
+    return word[:1].upper() + word[1:]
 
 
 def unique_path(path: Path) -> Path:
