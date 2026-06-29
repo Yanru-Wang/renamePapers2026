@@ -76,13 +76,15 @@ JOURNAL_ALIASES = {
     "math oper res": "MOR",
     "math or": "MOR",
     "naval research logistics": "NRL",
+    "networks": "Networks",
     "operations research": "OR",
     "operations research letters": "ORL",
     "production and operations management": "POM",
-    "siam journal on computing": "SICOMP",
-    "siam journal on discrete mathematics": "SIDMA",
-    "siam journal on applied mathematics": "SIAP",
-    "siam journal on optimization": "SIOPT",
+    "siam journal on algebraic and discrete methods": "SIAMJADM",
+    "siam journal on applied mathematics": "SIAMJAM",
+    "siam journal on computing": "SIAMJC",
+    "siam journal on discrete mathematics": "SIAMJDM",
+    "siam journal on optimization": "SIAMJO",
     "transportation science": "TS",
     # Self-aliases: parsed abbreviation → same abbreviation.
     "aor": "AOR",
@@ -95,13 +97,16 @@ JOURNAL_ALIASES = {
     "ms": "MS",
     "msom": "MSOM",
     "mor": "MOR",
+    "networks": "Networks",
     "nrl": "NRL",
     "or": "OR",
     "orl": "ORL",
     "pom": "POM",
-    "sicomp": "SICOMP",
-    "sidma": "SIDMA",
-    "siopt": "SIOPT",
+    "siamjadm": "SIAMJADM",
+    "siamjam": "SIAMJAM",
+    "siamjc": "SIAMJC",
+    "siamjdm": "SIAMJDM",
+    "siamjo": "SIAMJO",
     "ts": "TS",
 }
 
@@ -1683,6 +1688,8 @@ def journal_abbrev(metadata: dict[str, Any]) -> str | None:
     for candidate in (short_title, container_title):
         if candidate and (alias := journal_alias(candidate)):
             return alias
+        if candidate and (siam := siam_journal_abbrev(candidate)):
+            return siam
 
     if short_title and looks_like_abbreviated_journal(short_title):
         # "Math. Program." → initials give "MP", which is the standard abbrev.
@@ -1711,6 +1718,20 @@ def normalize_journal(value: str) -> str:
 def looks_like_abbreviated_journal(value: str) -> bool:
     clean = clean_journal(value)
     return "." in value or clean.isupper() or len(clean) <= 10
+
+
+def siam_journal_abbrev(value: str) -> str | None:
+    normalized = normalize_journal(value)
+    if not normalized.startswith("siam journal"):
+        return None
+    rest = normalized.removeprefix("siam journal").strip()
+    rest = re.sub(r"^(on|of|in|for)\s+", "", rest)
+    initials = [
+        word[0].upper()
+        for word in rest.split()
+        if word not in {"and", "for", "in", "of", "on", "the"}
+    ]
+    return "SIAMJ" + "".join(initials[:5]) if initials else "SIAMJ"
 
 
 def journal_initials(value: str) -> str | None:
