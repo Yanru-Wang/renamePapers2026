@@ -115,6 +115,11 @@ JOURNAL_ALIASES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Rename PDFs in ~/Papers/Inbox using DOI/Crossref metadata."
@@ -200,6 +205,11 @@ def main() -> int:
             print(f"FAIL {pdf}: {exc}", file=sys.stderr)
 
     return 1 if failures else 0
+
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestration
+# ---------------------------------------------------------------------------
 
 
 def process_pdf(
@@ -360,6 +370,11 @@ def process_pdf(
 
 def is_already_renamed(pdf: Path) -> bool:
     return bool(RENAMED_FILE_RE.match(pdf.stem))
+
+
+# ---------------------------------------------------------------------------
+# Text, OCR, and embedded PDF metadata extraction
+# ---------------------------------------------------------------------------
 
 
 def extract_text(pdf: Path) -> str:
@@ -616,6 +631,11 @@ def metadata_to_text(metadata: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Identifier extraction and metadata providers
+# ---------------------------------------------------------------------------
+
+
 def find_doi(text: str) -> str | None:
     match = DOI_RE.search(text)
     if not match:
@@ -715,6 +735,11 @@ def has_extractable_text(text: str) -> bool:
     """
     alpha = sum(ch.isalpha() for ch in text)
     return alpha >= 30
+
+
+# ---------------------------------------------------------------------------
+# Generic title, author, and metadata confidence helpers
+# ---------------------------------------------------------------------------
 
 
 def guess_title(text: str) -> str | None:
@@ -943,6 +968,11 @@ def metadata_title_appears_in_text(metadata: dict[str, Any], text: str) -> bool:
     return len(title_words & text_words) / len(title_words) >= 0.6
 
 
+# ---------------------------------------------------------------------------
+# Source-specific parsers
+# ---------------------------------------------------------------------------
+
+
 def thesis_metadata_from_text(text: str) -> dict[str, Any] | None:
     first_page = text.split("\f", 1)[0]
     lower_page = first_page.lower()
@@ -1119,6 +1149,12 @@ def looks_like_arxiv_author_line(line: str) -> bool:
     if "@" in line:
         return False
     words = WORD_RE.findall(line)
+    if not (
+        "," in line
+        or re.search(r"\s+and\s+", line)
+        or re.search(r"\b[A-Z]\.", line)
+    ):
+        return False
     return (
         2 <= len(words) <= 12
         and bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z]\.)?\s+[A-Z][a-z]+", line))
@@ -1500,6 +1536,11 @@ def fetch_json(url: str, mailto: str) -> dict[str, Any] | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Filename construction and source classification
+# ---------------------------------------------------------------------------
+
+
 def build_filename(
     metadata: dict[str, Any],
     suffix: str = "",
@@ -1766,6 +1807,21 @@ def looks_like_person_name(value: str) -> bool:
     return 2 <= len(words) <= 5 and any(len(word) == 1 for word in words[:-1])
 
 
+def looks_like_plain_author_line(value: str) -> bool:
+    if any(token in value.lower() for token in ("university", "department", "abstract")):
+        return False
+    words = WORD_RE.findall(value)
+    return (
+        2 <= len(words) <= 4
+        and all(word[:1].isupper() and word[1:].islower() for word in words)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Supplement matching
+# ---------------------------------------------------------------------------
+
+
 def supplement_suffix(pdf: Path, metadata: dict[str, Any], text: str) -> str:
     if looks_like_journal_article_text(text) or jstor_article_metadata_from_text(text):
         return ""
@@ -1822,6 +1878,11 @@ def _extract_main_title_from_supplement(text: str) -> str | None:
         lower = line.lower()
         if (
             looks_like_author_line(line)
+            or looks_like_person_name(line)
+            or (
+                len(WORD_RE.findall(" ".join(lines))) >= 5
+                and looks_like_plain_author_line(line)
+            )
             or "@" in line
             or lower.startswith(("abstract", "keywords", "school ", "department "))
             or re.match(r"^[A-Z]\.?\s*$", line)
@@ -1934,6 +1995,11 @@ def resolve_supplement_metadata(
         return outbox_match
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Journal abbreviations and filename token cleanup
+# ---------------------------------------------------------------------------
 
 
 def journal_abbrev(metadata: dict[str, Any]) -> str | None:
@@ -2066,6 +2132,11 @@ def format_word(word: str) -> str:
     if len(word) > 1 and word.isupper():
         word = word.lower()
     return word[:1].upper() + word[1:]
+
+
+# ---------------------------------------------------------------------------
+# Filesystem moves and collision handling
+# ---------------------------------------------------------------------------
 
 
 def move_or_deduplicate(pdf: Path, destination: Path, *, dry_run: bool) -> str:
