@@ -9,6 +9,7 @@ default so ~/Papers/Inbox stays as the intake queue.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -16,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -59,6 +61,7 @@ DEFAULT_MAILTO = os.environ.get("CROSSREF_MAILTO", "")
 USER_AGENT = "renamepapers/1.0 (mailto:{mailto})" if DEFAULT_MAILTO else "renamepapers/1.0"
 JOURNAL_ALIASES = {
     "annals of operations research": "AOR",
+    "arxiv": "ArXiv",
     "european journal of operational research": "EJOR",
     "informs journal on applied analytics": "IJAA",
     "informs journal on computing": "IJOC",
@@ -88,6 +91,7 @@ JOURNAL_ALIASES = {
     "transportation science": "TS",
     # Self-aliases: parsed abbreviation → same abbreviation.
     "aor": "AOR",
+    "arxiv": "ArXiv",
     "ejor": "EJOR",
     "ijaa": "IJAA",
     "ijoc": "IJOC",
@@ -150,7 +154,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--kind",
-        choices=("auto", "journal", "book", "bookchapter"),
+        choices=("auto", "journal", "book", "bookchapter", "thesis"),
         default="auto",
         help="Override source type when Crossref matches the wrong item.",
     )
@@ -217,6 +221,11 @@ def process_pdf(
 
     text = extract_text(pdf)
     pdf_metadata = extract_pdf_metadata(pdf)
+    if not has_extractable_text(text) and (not pdf_metadata or has_placeholder_pdf_metadata(pdf)):
+        ocr_text = extract_ocr_text(pdf)
+        if ocr_text.strip():
+            text = ocr_text
+
     metadata_text = metadata_to_text(pdf_metadata)
     doi = find_doi(text) or find_doi(metadata_text)
     metadata = crossref_by_doi(doi, mailto) if doi else None
@@ -226,6 +235,8 @@ def process_pdf(
         arxiv_id = find_arxiv(text)
         if arxiv_id:
             metadata = crossref_by_arxiv(arxiv_id, mailto)
+            if metadata is None:
+                metadata = arxiv_metadata_from_text(text)
 
     # Try ISBN lookup — especially useful for books and book chapters.
     if metadata is None and text.strip():
@@ -237,10 +248,22 @@ def process_pdf(
         metadata = handbook_chapter_metadata_from_text(text)
 
     if metadata is None and text.strip():
+        metadata = thesis_metadata_from_text(text)
+
+    if metadata is None and text.strip():
         metadata = article_metadata_from_text(text)
 
     if metadata is None and text.strip():
         metadata = book_metadata_from_text(text)
+
+    if metadata is None and text.strip():
+        main_title = _extract_main_title_from_supplement(text)
+        if main_title:
+            metadata = crossref_by_title(
+                main_title,
+                mailto,
+                author=guess_author(text),
+            )
 
     if metadata is None and text.strip():
         title_guess = guess_title(text)
@@ -286,17 +309,12 @@ def process_pdf(
                     metadata = manual_metadata(
                         title=title, author=author, year=year, kind=kind
                     )
-        elif is_already_renamed(pdf):
+        elif is_already_renamed(pdf) and not has_placeholder_pdf_metadata(pdf):
             new_name = pdf.name
             destination = (pdf.parent if in_place else outbox) / new_name
             if in_place and destination.resolve() == pdf.resolve():
                 return f"OK  {pdf.name} -> {destination}"
-            destination = unique_path(destination)
-            if dry_run:
-                return f"DRY {pdf.name} -> {destination}"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(pdf), str(destination))
-            return f"OK  {pdf.name} -> {destination}"
+            return move_or_deduplicate(pdf, destination, dry_run=dry_run)
         elif not title:
             if text.strip() and not has_extractable_text(text):
                 raise ValueError(
@@ -337,14 +355,7 @@ def process_pdf(
         author_override=author,
     )
     destination = (pdf.parent if in_place else outbox) / new_name
-    destination = unique_path(destination)
-
-    if dry_run:
-        return f"DRY {pdf.name} -> {destination}"
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(pdf), str(destination))
-    return f"OK  {pdf.name} -> {destination}"
+    return move_or_deduplicate(pdf, destination, dry_run=dry_run)
 
 
 def is_already_renamed(pdf: Path) -> bool:
@@ -379,6 +390,48 @@ def extract_text(pdf: Path) -> str:
             parts.append(py_text)
 
     return "\n".join(parts)
+
+
+def extract_ocr_text(pdf: Path, *, first_page: int = 1, last_page: int = 2) -> str:
+    """OCR scanned title pages using Poppler and Tesseract when available."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="renamepapers_ocr_") as tmp:
+            prefix = Path(tmp) / "page"
+            render = subprocess.run(
+                [
+                    "pdftoppm",
+                    "-f",
+                    str(first_page),
+                    "-l",
+                    str(last_page),
+                    "-png",
+                    "-r",
+                    "180",
+                    str(pdf),
+                    str(prefix),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if render.returncode != 0:
+                return ""
+
+            parts: list[str] = []
+            for image in sorted(Path(tmp).glob("page-*.png")):
+                completed = subprocess.run(
+                    ["tesseract", str(image), "stdout", "--psm", "6"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if completed.returncode == 0 and completed.stdout.strip():
+                    parts.append(completed.stdout)
+            return "\n\f\n".join(parts)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
 
 
 def extract_text_python(pdf: Path) -> str:
@@ -488,7 +541,7 @@ def extract_pdf_metadata(pdf: Path) -> dict[str, Any]:
 
     if title:
         title = clean_pdf_literal(title)
-        if not is_generic_pdf_title(title):
+        if not is_generic_pdf_title(title) and not is_placeholder_title(title):
             metadata["title"] = [title]
     if author:
         author_parts = WORD_RE.findall(clean_pdf_literal(author))
@@ -507,6 +560,21 @@ def extract_pdf_metadata(pdf: Path) -> dict[str, Any]:
     if metadata:
         metadata.setdefault("type", "journal-article")
     return metadata
+
+
+def has_placeholder_pdf_metadata(pdf: Path) -> bool:
+    raw = pdf.read_bytes().decode("latin-1", errors="ignore")
+    title = first_regex(
+        raw,
+        (
+            r"<dc:title>.*?<rdf:li[^>]*>(.*?)</rdf:li>.*?</dc:title>",
+            r"/Title\s*\((.*?)\)",
+        ),
+    )
+    if not title:
+        return False
+    title = clean_pdf_literal(title)
+    return is_generic_pdf_title(title) or is_placeholder_title(title)
 
 
 def first_regex(raw: str, patterns: tuple[str, ...]) -> str | None:
@@ -666,6 +734,10 @@ def guess_title(text: str) -> str | None:
                 "full length paper", "original paper", "research article",
                 "research paper", "short communication", "technical note",
                 "review article", "letter to the editor",
+                "submitted to",
+                "online appendices for",
+                "online appendix for",
+                "supplementary material for",
             )
         ):
             continue
@@ -729,6 +801,12 @@ def is_placeholder_title(title: str) -> bool:
     Catches cases like ``Times LT 27 X 42`` that were embedded in XMP
     metadata by a PDF creation tool.
     """
+    lowered = title.lower()
+    if "pdflib image sample" in lowered or (
+        lowered.startswith("adopted from") and "image sample" in lowered
+    ):
+        return True
+
     words = WORD_RE.findall(title)
     if not words:
         return True
@@ -865,6 +943,73 @@ def metadata_title_appears_in_text(metadata: dict[str, Any], text: str) -> bool:
     return len(title_words & text_words) / len(title_words) >= 0.6
 
 
+def thesis_metadata_from_text(text: str) -> dict[str, Any] | None:
+    first_page = text.split("\f", 1)[0]
+    lower_page = first_page.lower()
+    if not any(
+        marker in lower_page
+        for marker in (
+            "doctor of philosophy",
+            "submitted in partial fulfillment",
+            "thesis supervisor",
+            "dissertation",
+        )
+    ):
+        return None
+
+    lines = [
+        SPACE_RE.sub(" ", line).strip()
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+    if not lines:
+        return None
+
+    by_index = next((i for i, line in enumerate(lines[:20]) if line.lower() == "by"), -1)
+    if by_index <= 0:
+        return None
+
+    title_lines: list[str] = []
+    for line in lines[:by_index]:
+        lowered = line.lower()
+        if lowered.startswith(("library", "copyright", "@")):
+            continue
+        words = WORD_RE.findall(line)
+        if 2 <= len(words) <= 16 and sum(ch.isalpha() for ch in line) >= 10:
+            title_lines.append(line)
+    title = SPACE_RE.sub(" ", " ".join(title_lines)).strip()
+    if not title:
+        return None
+
+    author_line = None
+    for line in lines[by_index + 1 : by_index + 5]:
+        if re.search(r"\b[A-Z]\.\s*[A-Z]", line) or line.isupper():
+            author_line = line
+            break
+    if not author_line:
+        return None
+    author_words = WORD_RE.findall(author_line)
+    if not author_words:
+        return None
+
+    year_match = re.search(
+        r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+        r"dec(?:ember)?)\s+((?:19|20)\d{2})\b",
+        first_page,
+        flags=re.IGNORECASE,
+    ) or re.search(r"\b((?:19|20)\d{2})\b", first_page)
+
+    metadata: dict[str, Any] = {
+        "title": [title],
+        "author": [{"family": author_words[-1]}],
+        "type": "thesis",
+    }
+    if year_match:
+        metadata["issued"] = {"date-parts": [[int(year_match.group(1))]]}
+    return metadata
+
+
 def article_metadata_from_text(text: str) -> dict[str, Any] | None:
     if jstor_meta := jstor_article_metadata_from_text(text):
         return jstor_meta
@@ -895,6 +1040,90 @@ def article_metadata_from_text(text: str) -> dict[str, Any] | None:
     if author := journal_article_author_from_lines(lines, title):
         metadata["author"] = [{"family": author}]
     return metadata
+
+
+def arxiv_metadata_from_text(text: str) -> dict[str, Any] | None:
+    first_page = text.split("\f", 1)[0]
+    arxiv_id = find_arxiv(first_page)
+    if not arxiv_id:
+        return None
+
+    lines = [
+        SPACE_RE.sub(" ", line).strip()
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+
+    arxiv_line_index = next(
+        (i for i, line in enumerate(lines) if "arxiv:" in line.lower()),
+        -1,
+    )
+
+    title_lines: list[str] = []
+    for line in lines[: max(arxiv_line_index, 12)]:
+        lower = line.lower()
+        if lower.startswith("arxiv:") or re.search(r"\b\d{4}\s+[a-z]{3,9}\s+\d{4}\b", lower):
+            continue
+        if looks_like_arxiv_author_line(line):
+            break
+        if (
+            3 <= len(WORD_RE.findall(line)) <= 16
+            and sum(ch.isalpha() for ch in line) >= 12
+        ):
+            title_lines.append(line)
+
+    title = " ".join(title_lines).strip()
+    if not title:
+        title = guess_title(text) or ""
+    if not title:
+        return None
+
+    metadata: dict[str, Any] = {
+        "title": [title],
+        "type": "posted-content",
+        "container-title": ["arXiv"],
+        "DOI": f"arXiv:{arxiv_id}",
+    }
+
+    for line in lines[:30]:
+        if looks_like_arxiv_author_line(line):
+            first_author = re.split(r"\s+and\s+|,", line, maxsplit=1)[0]
+            first_author = re.sub(r"[*†‡§]+\d*", " ", first_author)
+            words = [w for w in WORD_RE.findall(first_author) if not w.isdigit()]
+            if words:
+                metadata["author"] = [{"family": words[-1]}]
+                break
+
+    year = arxiv_year(arxiv_id)
+    if year is None:
+        for line in lines[:20]:
+            match = re.search(r"\b((?:19|20)\d{2})\b", line)
+            if match:
+                year = match.group(1)
+                break
+    if year:
+        metadata["issued"] = {"date-parts": [[int(year)]]}
+
+    return metadata
+
+
+def arxiv_year(arxiv_id: str) -> str | None:
+    match = re.match(r"^(\d{2})(?:\d{2})?\.", arxiv_id)
+    if not match:
+        return None
+    yy = int(match.group(1))
+    return str(1900 + yy if yy >= 91 else 2000 + yy)
+
+
+def looks_like_arxiv_author_line(line: str) -> bool:
+    if "@" in line:
+        return False
+    words = WORD_RE.findall(line)
+    return (
+        2 <= len(words) <= 12
+        and bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z]\.)?\s+[A-Z][a-z]+", line))
+        and not line.lower().startswith(("abstract", "keywords", "arxiv"))
+    )
 
 
 def handbook_chapter_metadata_from_text(text: str) -> dict[str, Any] | None:
@@ -1304,6 +1533,8 @@ def manual_metadata(
         metadata["type"] = "book"
     elif kind == "bookchapter":
         metadata["type"] = "book-chapter"
+    elif kind == "thesis":
+        metadata["type"] = "thesis"
     elif kind == "journal":
         metadata["type"] = "journal-article"
     return metadata
@@ -1314,10 +1545,14 @@ def source_prefix(metadata: dict[str, Any], kind: str | None = None) -> str:
         return "Book"
     if kind == "bookchapter":
         return "BookChapter"
+    if kind == "thesis":
+        return "Thesis"
     if kind == "journal":
         return journal_abbrev(metadata) or "UnknownJournal"
 
     item_type = str(metadata.get("type") or "").lower()
+    if item_type in {"thesis", "dissertation"}:
+        return "Thesis"
     if item_type in {"book", "monograph", "reference-book", "book-series"}:
         return "Book"
     if item_type in {
@@ -1348,6 +1583,8 @@ def infer_kind(
         return forced_kind
 
     item_type = str(metadata.get("type") or "").lower()
+    if item_type in {"thesis", "dissertation"}:
+        return "thesis"
     if item_type in {"book", "monograph", "reference-book", "book-series"}:
         return "book"
     if item_type in {
@@ -1559,6 +1796,7 @@ _SUPP_REF_RE = re.compile(
     r"supplementary\s+material\s+(?:for|to)[:\s]*|"
     r"online\s+supplement\s+(?:for|to)[:\s]*|"
     r"supplement(?:ary)?\s+(?:for|to)[:\s]*|"
+    r"online\s+appendi(?:x|ces)\s+(?:for|to)[:\s]*|"
     r"appendi(?:x|ces)\s+to[:\s]*"
     r")"
     r"([^\n]{15,250})",
@@ -1575,8 +1813,25 @@ def _extract_main_title_from_supplement(text: str) -> str | None:
     if not match:
         return None
     candidate = match.group(1).strip().strip('"\'')
-    # Stop at line end, then clean trailing punctuation.
-    candidate = candidate.split("\n")[0].strip()
+    lines = [candidate.split("\n")[0].strip()]
+    tail = text[match.end() :].splitlines()
+    for line in tail[:5]:
+        line = SPACE_RE.sub(" ", line).strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if (
+            looks_like_author_line(line)
+            or "@" in line
+            or lower.startswith(("abstract", "keywords", "school ", "department "))
+            or re.match(r"^[A-Z]\.?\s*$", line)
+        ):
+            break
+        if 1 <= len(WORD_RE.findall(line)) <= 14:
+            lines.append(line)
+            continue
+        break
+    candidate = SPACE_RE.sub(" ", " ".join(lines)).strip()
     if candidate.endswith(".") and not re.search(r"\b[A-Z]\.$", candidate):
         candidate = candidate[:-1].strip()
     if 10 <= len(candidate) <= 250:
@@ -1811,6 +2066,48 @@ def format_word(word: str) -> str:
     if len(word) > 1 and word.isupper():
         word = word.lower()
     return word[:1].upper() + word[1:]
+
+
+def move_or_deduplicate(pdf: Path, destination: Path, *, dry_run: bool) -> str:
+    """Move *pdf* unless destination already has identical content."""
+    if destination.exists() and not same_path(pdf, destination):
+        if same_file_content(pdf, destination):
+            if dry_run:
+                return f"DUP {pdf.name} == {destination}"
+            pdf.unlink()
+            return f"DUP {pdf.name} == {destination} (removed duplicate)"
+        destination = unique_path(destination)
+
+    if dry_run:
+        return f"DRY {pdf.name} -> {destination}"
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(pdf), str(destination))
+    return f"OK  {pdf.name} -> {destination}"
+
+
+def same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
+def same_file_content(a: Path, b: Path) -> bool:
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+    except OSError:
+        return False
+    return file_digest(a) == file_digest(b)
+
+
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def unique_path(path: Path) -> Path:
