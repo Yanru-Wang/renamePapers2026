@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from renamepapers import core as renamepapers
+from renamepapers import files
 
 
 BERTSIMAS_OCR_TEXT = """PROBABILISTIC COMBINATORIAL OPTIMIZATION PROBLEMS
@@ -96,11 +97,11 @@ Jane Doe
             source.write_bytes(b"same-content")
             destination.write_bytes(b"same-content")
 
-            dry = renamepapers.move_or_deduplicate(source, destination, dry_run=True)
+            dry = files.move_or_deduplicate(source, destination, dry_run=True)
             self.assertTrue(dry.startswith("DUP "))
             self.assertTrue(source.exists())
 
-            real = renamepapers.move_or_deduplicate(source, destination, dry_run=False)
+            real = files.move_or_deduplicate(source, destination, dry_run=False)
             self.assertTrue(real.startswith("DUP "))
             self.assertFalse(source.exists())
             self.assertTrue(destination.exists())

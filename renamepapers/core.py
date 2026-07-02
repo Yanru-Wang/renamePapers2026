@@ -9,26 +9,38 @@ default so ~/Papers/Inbox stays as the intake queue.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import html
-import json
-import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
-import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
 
+from .common import (
+    SPACE_RE,
+    WORD_RE,
+    ascii_fold,
+    clean_token,
+    clean_year,
+    first_value,
+    format_word,
+    shorten_title,
+    titles_match,
+)
+from .files import move_or_deduplicate
+from .providers import (
+    DEFAULT_MAILTO,
+    crossref_by_arxiv,
+    crossref_by_doi,
+    crossref_by_isbn,
+    crossref_by_title,
+    find_arxiv,
+    find_doi,
+    find_isbn,
+)
 
-DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
-SPACE_RE = re.compile(r"\s+")
-WORD_RE = re.compile(r"[^\W_]+")  # Unicode letters + digits, excluding underscore
+
 RENAMED_FILE_RE = re.compile(
     r"^(?:Book|BookChapter|[A-Z][A-Za-z0-9]{1,12})[-_][A-Za-z][A-Za-z0-9]*"
     r"(?:19|20)\d{2}[-_][A-Za-z0-9][A-Za-z0-9_]*(?:_supplement)?$"
@@ -57,8 +69,6 @@ BOOK_EVIDENCE_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-DEFAULT_MAILTO = os.environ.get("CROSSREF_MAILTO", "")
-USER_AGENT = "renamepapers/1.0 (mailto:{mailto})" if DEFAULT_MAILTO else "renamepapers/1.0"
 JOURNAL_ALIASES = {
     "annals of operations research": "AOR",
     "arxiv": "ArXiv",
@@ -631,103 +641,6 @@ def metadata_to_text(metadata: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Identifier extraction and metadata providers
-# ---------------------------------------------------------------------------
-
-
-def find_doi(text: str) -> str | None:
-    match = DOI_RE.search(text)
-    if not match:
-        return None
-    doi = match.group(0).strip()
-    return doi.rstrip(".,;:)]}>").lower()
-
-
-ISBN_RE = re.compile(
-    r"\b(?:ISBN(?:-1[03])?[:\s]*)?((?:97[89])?[\d\-]{10,17})\b",
-    re.IGNORECASE,
-)
-ARXIV_RE = re.compile(
-    r"\barXiv[:\s]*(\d{4}\.\d{4,5}(?:v\d+)?)\b", re.IGNORECASE
-)
-
-
-def find_isbn(text: str) -> str | None:
-    """Extract an ISBN from *text* and return it normalised (digits only)."""
-    match = ISBN_RE.search(text)
-    if not match:
-        return None
-    raw = match.group(1)
-    digits = re.sub(r"[^0-9X]", "", raw.upper())
-    if len(digits) not in (10, 13):
-        return None
-    return digits
-
-
-def crossref_by_isbn(isbn: str, mailto: str) -> dict[str, Any] | None:
-    """Look up *isbn* via Crossref and return the *book-level* metadata.
-
-    A single ISBN can match many chapters; we prefer the item whose type
-    is ``book``, ``monograph`` or ``edited-book``.
-    """
-    params = urllib.parse.urlencode({"filter": f"isbn:{isbn}", "rows": "20"})
-    payload = fetch_json(
-        f"https://api.crossref.org/works?{params}", mailto
-    )
-    items = payload.get("message", {}).get("items", []) if payload else []
-    if not items:
-        return None
-    # Validate: result must actually contain the ISBN we searched for.
-    valid: list[dict[str, Any]] = []
-    for item in items:
-        item_isbns = item.get("isbn") or item.get("ISBN") or []
-        if isinstance(item_isbns, str):
-            item_isbns = [item_isbns]
-        # Match either exact ISBN or cleaned digits.
-        if isbn in item_isbns or any(
-            re.sub(r"[^0-9X]", "", str(i).upper()) == isbn for i in item_isbns
-        ):
-            valid.append(item)
-    if not valid:
-        return None  # no result actually carries this ISBN — untrustworthy
-    # Prefer the book-level record (not individual chapters).
-    book_types = {"book", "monograph", "edited-book", "reference-book"}
-    for item in valid:
-        if str(item.get("type") or "").lower() in book_types:
-            return item
-    # Fall back to an item whose title matches its container-title (book).
-    for item in valid:
-        item_title = first_value(item.get("title")) or ""
-        container = first_value(item.get("container-title")) or ""
-        if container and item_title != container:
-            continue
-        if not container:
-            return item
-    return valid[0]
-
-
-def find_arxiv(text: str) -> str | None:
-    """Extract an arXiv ID from *text* (e.g. ``2103.12345``)."""
-    match = ARXIV_RE.search(text)
-    if not match:
-        return None
-    # Strip version suffix for lookup (2103.12345v2 → 2103.12345).
-    return match.group(1).rstrip("v").split("v")[0]
-
-
-def crossref_by_arxiv(arxiv_id: str, mailto: str) -> dict[str, Any] | None:
-    """Look up an arXiv ID via Crossref."""
-    params = urllib.parse.urlencode(
-        {"filter": f"arxiv:{arxiv_id}", "rows": "1"}
-    )
-    payload = fetch_json(
-        f"https://api.crossref.org/works?{params}", mailto
-    )
-    items = payload.get("message", {}).get("items", []) if payload else []
-    return items[0] if items else None
-
-
 def has_extractable_text(text: str) -> bool:
     """Return True when *text* contains enough substance to identify a paper.
 
@@ -853,92 +766,6 @@ def is_placeholder_title(title: str) -> bool:
         return True
 
     return False
-
-
-def titles_match(query: str, result: str) -> bool:
-    """Return True when *result* title is broadly consistent with *query*.
-
-    Crossref ``query.title`` does loose matching so a garbage query like
-    ``Times LT 27 X 42`` can match an unrelated work that happens to share
-    one word.  We require at least two overlapping words, at least 50 %
-    of the smaller word-set to be shared, and a reasonable sequence-match
-    ratio (LCS distance, as used by Zotero's PDF recognizer).
-    """
-    import difflib
-
-    query_words = {w.lower() for w in WORD_RE.findall(query) if len(w) >= 2}
-    result_words = {w.lower() for w in WORD_RE.findall(result) if len(w) >= 2}
-    if not query_words or not result_words:
-        return False
-    overlap = query_words & result_words
-    if len(overlap) < 2:
-        return False
-    if len(overlap) / min(len(query_words), len(result_words)) < 0.5:
-        return False
-
-    # Sequence-matcher sanity check: the strings should look broadly alike.
-    ratio = difflib.SequenceMatcher(
-        None, query.lower(), result.lower()
-    ).ratio()
-    return ratio >= 0.25
-
-
-def crossref_by_doi(doi: str | None, mailto: str) -> dict[str, Any] | None:
-    if not doi:
-        return None
-    url = f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
-    payload = fetch_json(url, mailto)
-    return payload.get("message") if payload else None
-
-
-def crossref_by_title(
-    title: str, mailto: str, *, author: str | None = None
-) -> dict[str, Any] | None:
-    """Search Crossref by *title*.  When *author* is given, request multiple
-    results and return the first whose author list contains *author*."""
-    params = {
-        "query.title": title,
-        "rows": "5",
-        "select": ",".join(
-            (
-                "DOI",
-                "title",
-                "author",
-                "editor",
-                "issued",
-                "published-print",
-                "published-online",
-                "container-title",
-                "short-container-title",
-                "type",
-                "ISBN",
-                "publisher",
-                "relation",
-            )
-        ),
-    }
-    payload = fetch_json(
-        f"https://api.crossref.org/works?{urllib.parse.urlencode(params)}", mailto
-    )
-    items = payload.get("message", {}).get("items", []) if payload else []
-    if not items:
-        return None
-    title_matches = [
-        item for item in items
-        if titles_match(title, first_value(item.get("title")) or "")
-    ]
-    if not title_matches:
-        return None
-    if author:
-        # Filter to the first result that includes *author*.
-        author_lower = author.lower()
-        for item in title_matches:
-            for a in item.get("author") or []:
-                family = (a.get("family") or "").lower()
-                given = (a.get("given") or "").lower()
-                if author_lower in family or author_lower in given:
-                    return item
-    return title_matches[0]
 
 
 def enrich_metadata_from_text(metadata: dict[str, Any], text: str) -> None:
@@ -1526,16 +1353,6 @@ def collapse_spaced_letters(value: str) -> str:
     )
 
 
-def fetch_json(url: str, mailto: str) -> dict[str, Any] | None:
-    agent = f"renamepapers/1.0 (mailto:{mailto})" if mailto else USER_AGENT
-    request = urllib.request.Request(url, headers={"User-Agent": agent})
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Filename construction and source classification
 # ---------------------------------------------------------------------------
@@ -2084,114 +1901,9 @@ def publication_year(metadata: dict[str, Any]) -> str | None:
     return None
 
 
-def clean_year(value: str | None) -> str | None:
-    if not value:
-        return None
-    match = re.search(r"\b(?:19|20)\d{2}\b", value)
-    return match.group(0) if match else None
-
-
-def shorten_title(title: str, max_chars: int = 80) -> str:
-    words = WORD_RE.findall(ascii_fold(title))
-    kept: list[str] = []
-    for word in words:
-        if not any(ch.isalnum() for ch in word):
-            continue
-        kept.append(format_word(word))
-
-    compact = "_".join(kept) or "Untitled"
-    return compact[:max_chars].rstrip("_-")
-
-
-def first_value(value: Any) -> str | None:
-    if isinstance(value, list) and value:
-        return str(value[0])
-    if isinstance(value, str):
-        return value
-    return None
-
-
 def clean_journal(value: str) -> str:
     words = WORD_RE.findall(ascii_fold(value))
     return "".join(format_word(word) for word in words)[:32]
-
-
-def ascii_fold(value: str) -> str:
-    """Normalize Unicode diacritics to ASCII equivalents (e.g. 'ć' → 'c')."""
-    normalized = unicodedata.normalize("NFKD", value)
-    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
-
-
-def clean_token(value: str, max_words: int) -> str:
-    value = ascii_fold(value)
-    words = WORD_RE.findall(value)[:max_words]
-    return "".join(format_word(word) for word in words)
-
-
-def format_word(word: str) -> str:
-    if len(word) > 1 and word.isupper():
-        word = word.lower()
-    return word[:1].upper() + word[1:]
-
-
-# ---------------------------------------------------------------------------
-# Filesystem moves and collision handling
-# ---------------------------------------------------------------------------
-
-
-def move_or_deduplicate(pdf: Path, destination: Path, *, dry_run: bool) -> str:
-    """Move *pdf* unless destination already has identical content."""
-    if destination.exists() and not same_path(pdf, destination):
-        if same_file_content(pdf, destination):
-            if dry_run:
-                return f"DUP {pdf.name} == {destination}"
-            pdf.unlink()
-            return f"DUP {pdf.name} == {destination} (removed duplicate)"
-        destination = unique_path(destination)
-
-    if dry_run:
-        return f"DRY {pdf.name} -> {destination}"
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(pdf), str(destination))
-    return f"OK  {pdf.name} -> {destination}"
-
-
-def same_path(a: Path, b: Path) -> bool:
-    try:
-        return a.resolve() == b.resolve()
-    except OSError:
-        return False
-
-
-def same_file_content(a: Path, b: Path) -> bool:
-    try:
-        if a.stat().st_size != b.stat().st_size:
-            return False
-    except OSError:
-        return False
-    return file_digest(a) == file_digest(b)
-
-
-def file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem = path.stem
-    suffix = path.suffix
-    counter = 2
-    while True:
-        candidate = path.with_name(f"{stem}-{counter}{suffix}")
-        if not candidate.exists():
-            return candidate
-        counter += 1
 
 
 if __name__ == "__main__":
