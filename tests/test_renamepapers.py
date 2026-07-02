@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
 
-
-ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("renamepapers_script", ROOT / "renamepapers.py")
-renamepapers = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(renamepapers)
+from renamepapers import core as renamepapers
 
 
 BERTSIMAS_OCR_TEXT = """PROBABILISTIC COMBINATORIAL OPTIMIZATION PROBLEMS

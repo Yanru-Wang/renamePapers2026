@@ -3,10 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
+LIB_DIR="${HOME}/.local/lib/renamepapers"
 TARGET="${BIN_DIR}/renamepapers"
 
-mkdir -p "${HOME}/Papers/Inbox" "${HOME}/Papers/Renamed" "${BIN_DIR}"
+mkdir -p "${HOME}/Papers/Inbox" "${HOME}/Papers/Renamed" "${BIN_DIR}" "${LIB_DIR}"
 cp "${SCRIPT_DIR}/renamepapers.py" "${TARGET}"
+rm -rf "${LIB_DIR}/renamepapers"
+cp -R "${SCRIPT_DIR}/renamepapers" "${LIB_DIR}/renamepapers"
 chmod +x "${TARGET}"
 
 if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "${HOME}/.zshrc" 2>/dev/null; then
