@@ -6,6 +6,7 @@ from pathlib import Path
 
 from renamepapers import core as renamepapers
 from renamepapers import files
+from renamepapers import naming
 
 
 BERTSIMAS_OCR_TEXT = """PROBABILISTIC COMBINATORIAL OPTIMIZATION PROBLEMS
@@ -38,15 +39,15 @@ class RenamePapersTests(unittest.TestCase):
         self.assertEqual(metadata["author"], [{"family": "BERTSIMAS"}])
         self.assertEqual(metadata["issued"], {"date-parts": [[1988]]})
         self.assertEqual(metadata["type"], "thesis")
-        self.assertEqual(renamepapers.source_prefix(metadata), "Thesis")
-        kind = renamepapers.infer_kind(
+        self.assertEqual(naming.source_prefix(metadata), "Thesis")
+        kind = naming.infer_kind(
             Path("x.pdf"),
             metadata,
             BERTSIMAS_OCR_TEXT,
             forced_kind="auto",
         )
         self.assertEqual(
-            renamepapers.build_filename(metadata, kind=kind),
+            naming.build_filename(metadata, kind=kind),
             "Thesis-Bertsimas1988-Probabilistic_Combinatorial_Optimization_Problems.pdf",
         )
 
@@ -75,7 +76,7 @@ arXiv:2604.02496v1 [math.OC] 3 Apr 2026
         self.assertEqual(metadata["container-title"], ["arXiv"])
         self.assertEqual(metadata["issued"], {"date-parts": [[2026]]})
         self.assertEqual(metadata["author"], [{"family": "Doe"}])
-        self.assertEqual(renamepapers.source_prefix(metadata), "ArXiv")
+        self.assertEqual(naming.source_prefix(metadata), "ArXiv")
 
     def test_extract_main_title_from_supplement_header(self) -> None:
         text = """Submitted to Transportation Science
