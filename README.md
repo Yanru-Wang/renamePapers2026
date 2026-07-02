@@ -7,6 +7,9 @@ Scans `~/Papers/Inbox` by default and moves successfully renamed PDFs to
 
 The tool is intentionally conservative: when the available evidence is weak, it
 fails and asks for an explicit override instead of silently inventing a filename.
+It also treats supplements and online appendices as first-class intake items,
+so add-on PDFs can stay discoverable next to the main paper instead of getting
+renamed from generic cover-page text.
 
 ## Workflow
 
@@ -114,9 +117,14 @@ Supervisor` are classified as `Thesis`.
 **Book detection**: trusts Crossref type; text heuristics (`preface`, `index`,
 `isbn`) only used when Crossref type is ambiguous.
 
-**Supplement handling**: online appendix / supplementary material headers are
-parsed before generic title guessing, so the filename can follow the main paper
-instead of the appendix cover text.
+**Supplement handling**: online appendix and supplementary material PDFs are
+common in research folders, but their first pages often start with generic text
+such as `Submitted to ...`, `Online Appendices for:`, or supplementary-material
+headers. The script parses those headers before generic title guessing, extracts
+the main paper title when possible, and names the add-on with the main paper's
+metadata plus a `_supplement` suffix. This keeps a paper and its supplement
+together in filename search while avoiding false Crossref matches from the
+appendix cover page.
 
 **Duplicate handling**: if a destination already exists, identical files are
 detected by SHA-256 and reported as `DUP`; different-content collisions are kept
@@ -140,6 +148,7 @@ Examples:
 - `MP-Dey2012-Some_Properties_Of_Convex_Hulls_Of_Integer_Points.pdf`
 - `Book-Wolsey2020-Integer_Programming.pdf`
 - `Thesis-Bertsimas1988-Probabilistic_Combinatorial_Optimization_Problems.pdf`
+- `TS-Wissink2023-Routing_Optimization_With_Stochastic_Service_Times_supplement.pdf`
 - `COA-Bernal2024-Convex_Mixed_Integer_Nonlinear_Programs_Derived_From_Generalized_Disjunctive_Pro.pdf`
 
 ## Options
