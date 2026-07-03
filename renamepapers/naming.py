@@ -55,6 +55,7 @@ JOURNAL_ALIASES = {
     "networks": "Networks",
     "operations research": "OR",
     "operations research letters": "ORL",
+    "optimization online": "OptimizationOnline",
     "production and operations management": "POM",
     "siam journal on algebraic and discrete methods": "SIAMJADM",
     "siam journal on applied mathematics": "SIAMJAM",
@@ -94,7 +95,7 @@ def build_filename(
     author_override: str | None = None,
 ) -> str:
     source = source_prefix(metadata, kind=kind)
-    author = clean_token(author_override, max_words=1) if author_override else None
+    author = clean_author_token(author_override) if author_override else None
     author = author or first_author(metadata) or "Unknown"
     year = clean_year(year_override) or publication_year(metadata) or "Undated"
     title = (
@@ -184,6 +185,8 @@ def infer_kind(
         "book-section",
     }:
         return "bookchapter"
+    if item_type in {"posted-content", "preprint"}:
+        return None
     if item_type in {"journal-article", "proceedings-article", "journal-issue"}:
         return None
 
@@ -264,7 +267,16 @@ def first_author(metadata: dict[str, Any]) -> str | None:
     name = first.get("family") or first.get("name") or first.get("given")
     if not name:
         return None
-    return clean_token(name, max_words=1) or None
+    return clean_author_token(name) or None
+
+
+def clean_author_token(value: str) -> str | None:
+    value = ascii_fold(value)
+    match = re.search(r"[A-Za-z0-9]+(?:[-'’][A-Za-z0-9]+)*", value)
+    if not match:
+        return None
+    parts = re.split(r"[-'’]", match.group(0))
+    return "".join(format_word(part) for part in parts if part)
 
 
 def publication_year(metadata: dict[str, Any]) -> str | None:

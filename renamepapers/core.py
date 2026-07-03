@@ -205,6 +205,9 @@ def process_pdf(
         metadata = thesis_metadata_from_text(text)
 
     if metadata is None and text.strip():
+        metadata = preprint_metadata_from_text(text)
+
+    if metadata is None and text.strip():
         metadata = article_metadata_from_text(text)
 
     if metadata is None and text.strip():
@@ -853,7 +856,11 @@ def arxiv_metadata_from_text(text: str) -> dict[str, Any] | None:
     title_lines: list[str] = []
     for line in lines[: max(arxiv_line_index, 12)]:
         lower = line.lower()
-        if lower.startswith("arxiv:") or re.search(r"\b\d{4}\s+[a-z]{3,9}\s+\d{4}\b", lower):
+        if (
+            lower.startswith("arxiv:")
+            or lower.startswith("journal of latex class files")
+            or re.search(r"\b\d{4}\s+[a-z]{3,9}\s+\d{4}\b", lower)
+        ):
             continue
         if looks_like_arxiv_author_line(line):
             break
@@ -898,6 +905,101 @@ def arxiv_metadata_from_text(text: str) -> dict[str, Any] | None:
     return metadata
 
 
+def preprint_metadata_from_text(text: str) -> dict[str, Any] | None:
+    first_page = text.split("\f", 1)[0]
+    marker = re.search(
+        r"(?im)^Preprint submitted to\s*(.*?)\s*"
+        r"((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
+        r"Dec(?:ember)?)\s+\d{1,2},\s+((?:19|20)\d{2}))\s*$",
+        first_page,
+    )
+    if not marker:
+        return None
+
+    lines = [
+        SPACE_RE.sub(" ", line).strip()
+        for line in first_page.splitlines()
+        if SPACE_RE.sub(" ", line).strip()
+    ]
+    marker_index = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if line.lower().startswith("preprint submitted to")
+        ),
+        len(lines),
+    )
+
+    title_lines: list[str] = []
+    for line in lines[:marker_index]:
+        lower = line.lower()
+        if lower.startswith(("abstract", "keywords")):
+            break
+        if (
+            "@" in line
+            or re.search(
+                r"\b(?:university|faculty|department|institute|email addresses?)\b",
+                lower,
+            )
+            or looks_like_preprint_author_line(line)
+        ):
+            if title_lines:
+                break
+            continue
+        words = WORD_RE.findall(line)
+        if 2 <= len(words) <= 18 and sum(ch.isalpha() for ch in line) >= 10:
+            title_lines.append(line)
+
+    title = SPACE_RE.sub(" ", " ".join(title_lines)).strip()
+    if not title:
+        return None
+
+    venue = SPACE_RE.sub(" ", marker.group(1)).strip()
+    metadata: dict[str, Any] = {
+        "title": [title],
+        "type": "posted-content",
+        "container-title": [venue or "Optimization Online"],
+        "issued": {"date-parts": [[int(marker.group(3))]]},
+    }
+    if author := preprint_author_from_first_page(first_page, lines[:marker_index]):
+        metadata["author"] = [{"family": author}]
+    return metadata
+
+
+def looks_like_preprint_author_line(line: str) -> bool:
+    if "," not in line and not re.search(r"\b[A-Z]\.", line):
+        return False
+    words = WORD_RE.findall(line)
+    if not (2 <= len(words) <= 14):
+        return False
+    return bool(re.search(r"\b[A-Z][a-z]+[A-Za-z]*\b", line))
+
+
+def preprint_author_from_first_page(first_page: str, lines: list[str]) -> str | None:
+    paren_names = re.findall(
+        r"\(([A-Z][A-Za-z.\- ]+\s+[A-Z][A-Za-z.\- ]+)\)",
+        first_page,
+    )
+    if paren_names:
+        words = WORD_RE.findall(paren_names[0])
+        if words:
+            return words[-1]
+
+    for line in lines:
+        if not looks_like_preprint_author_line(line):
+            continue
+        first_author = re.split(r",|\s+and\s+", line, maxsplit=1)[0]
+        first_author = re.sub(r"[*†‡§,]+", " ", first_author)
+        words = WORD_RE.findall(first_author)
+        if len(words) >= 2:
+            surname = words[-1]
+            if surname.endswith(("a", "b", "c")) and len(surname) > 3:
+                surname = surname[:-1]
+            return surname
+    return None
+
+
 def arxiv_year(arxiv_id: str) -> str | None:
     match = re.match(r"^(\d{2})(?:\d{2})?\.", arxiv_id)
     if not match:
@@ -917,7 +1019,7 @@ def looks_like_arxiv_author_line(line: str) -> bool:
     ):
         return False
     return (
-        2 <= len(words) <= 12
+        2 <= len(words) <= 40
         and bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z]\.)?\s+[A-Z][a-z]+", line))
         and not line.lower().startswith(("abstract", "keywords", "arxiv"))
     )

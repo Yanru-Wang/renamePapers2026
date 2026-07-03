@@ -86,7 +86,10 @@ renamepapers --kind thesis --title "..." --author Bertsimas --year 1988 thesis.p
 
 ## How It Works
 
-The script tries identifiers and evidence in cascade order:
+The script tries identifiers and evidence in cascade order.  Strong page
+evidence is allowed to override weak heuristics, but weak heuristics must not
+override explicit identifiers or source-specific headers; see
+`docs/evidence_hierarchy.md`.
 
 | Step | Method | Fallback |
 |------|--------|----------|
@@ -132,6 +135,20 @@ with a numeric suffix instead of being overwritten.
 
 **Journal abbreviation**: uses Crossref `short-container-title`, explicit aliases
 for common journals, and conservative initials for already-abbreviated names.
+
+## Regression Checks
+
+Before syncing changes to the installed command, run both parser unit tests and
+the real-PDF golden dry-run checks:
+
+```bash
+python3 -m unittest tests/test_renamepapers.py
+python3 tests/golden_dry_run.py --command /Users/wyr/.local/bin/renamepapers --strict-missing
+```
+
+When fixing a wrong filename, add a unit test for the parser rule and, when the
+real PDF should stay on this machine, add its expected dry-run output to
+`tests/golden_renames.tsv`.
 
 ## Filename Format
 
