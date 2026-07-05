@@ -26,11 +26,25 @@ USER_AGENT = "renamepapers/1.0 (mailto:{mailto})" if DEFAULT_MAILTO else "rename
 
 
 def find_doi(text: str) -> str | None:
+    text = normalize_extracted_doi_text(text)
     match = DOI_RE.search(text)
     if not match:
         return None
     doi = match.group(0).strip()
     return doi.rstrip(".,;:)]}>").lower()
+
+
+def normalize_extracted_doi_text(text: str) -> str:
+    """Repair common PDF text-extraction spaces inside DOI suffixes."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(
+            r"(?i)(10\.\d{4,9}/[-._;()/:A-Z0-9]*[._;()/:])\s+([A-Z0-9])",
+            r"\1\2",
+            text,
+        )
+    return text
 
 
 def find_isbn(text: str) -> str | None:

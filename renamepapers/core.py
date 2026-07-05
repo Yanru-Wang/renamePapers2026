@@ -1188,18 +1188,21 @@ def jstor_article_metadata_from_text(text: str) -> dict[str, Any] | None:
     if not any("jstor.org/stable/" in line.lower() for line in lines):
         return None
 
-    title = None
+    title_lines: list[str] = []
     author_line = None
     source_line = None
     for line in lines[:30]:
         lower = line.lower()
         if lower.startswith("author(s):"):
             author_line = line
+            if title_lines:
+                continue
         elif lower.startswith("source:"):
             source_line = line
-        elif title is None and not lower.startswith(("author(s):", "source:")):
-            title = line
+        elif author_line is None:
+            title_lines.append(line)
 
+    title = " ".join(title_lines).strip()
     if not title or not source_line:
         return None
 

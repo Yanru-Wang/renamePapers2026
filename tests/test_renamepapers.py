@@ -168,6 +168,77 @@ Preprint submitted to March 7, 2026
         self.assertEqual(metadata["author"], [{"family": "Han"}])
         self.assertEqual(naming.source_prefix(metadata), "OptimizationOnline")
 
+    def test_jstor_multiline_title_and_spaced_doi(self) -> None:
+        text = """Facility Reliability Issues in Network p-Median Problems: Strategic Centralization and
+Co-Location Effects
+Author(s): Oded Berman, Dmitry Krass and Mozart B. C. Menezes
+Source: Operations Research , Mar. - Apr., 2007, Vol. 55, No. 2 (Mar. - Apr., 2007), pp.
+332-350
+Published by: INFORMS
+
+Stable URL: https://www.jstor.org/stable/25147081
+
+Operations Research
+Vol. 55, No. 2, March-April 2007, pp. 332-350
+issn0030-364X | eissn 1526-54631071550210332 doi 10.1287/opre. 1060.0348
+"""
+
+        self.assertEqual(renamepapers.find_doi(text), "10.1287/opre.1060.0348")
+        metadata = renamepapers.jstor_article_metadata_from_text(text)
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(
+            metadata["title"],
+            [
+                "Facility Reliability Issues in Network p-Median Problems: "
+                "Strategic Centralization and Co-Location Effects"
+            ],
+        )
+        self.assertEqual(metadata["container-title"], ["Operations Research"])
+        self.assertEqual(metadata["issued"], {"date-parts": [[2007]]})
+        self.assertEqual(metadata["author"], [{"family": "Berman"}])
+        self.assertEqual(
+            naming.build_filename(metadata),
+            "OR-Berman2007-Facility_Reliability_Issues_In_Network_P_Median_"
+            "Problems_Strategic_Centralizatio.pdf",
+        )
+
+    def test_crossref_html_title_tags_are_not_filename_words(self) -> None:
+        metadata = {
+            "title": [
+                "Facility Reliability Issues in Network <i>p</i>-Median "
+                "Problems: Strategic Centralization and Co-Location Effects"
+            ],
+            "author": [{"family": "Berman"}],
+            "issued": {"date-parts": [[2007]]},
+            "container-title": ["Operations Research"],
+            "type": "journal-article",
+        }
+
+        self.assertEqual(
+            naming.build_filename(metadata),
+            "OR-Berman2007-Facility_Reliability_Issues_In_Network_P_Median_"
+            "Problems_Strategic_Centralizatio.pdf",
+        )
+
+    def test_title_roman_numerals_stay_uppercase(self) -> None:
+        metadata = {
+            "title": [
+                "On the symmetric travelling salesman problem II: lifting "
+                "theorems and facets"
+            ],
+            "author": [{"family": "Grotschel"}],
+            "issued": {"date-parts": [[1979]]},
+            "container-title": ["Mathematical Programming"],
+            "type": "journal-article",
+        }
+
+        self.assertEqual(
+            naming.build_filename(metadata),
+            "MP-Grotschel1979-On_The_Symmetric_Travelling_Salesman_Problem_"
+            "II_Lifting_Theorems_And_Facets.pdf",
+        )
+
     def test_duplicate_destination_reports_dup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

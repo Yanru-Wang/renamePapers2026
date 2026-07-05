@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import unicodedata
 from typing import Any
@@ -9,6 +10,9 @@ from typing import Any
 
 SPACE_RE = re.compile(r"\s+")
 WORD_RE = re.compile(r"[^\W_]+")  # Unicode letters + digits, excluding underscore
+ROMAN_NUMERAL_RE = re.compile(
+    r"M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})"
+)
 
 
 def first_value(value: Any) -> str | None:
@@ -45,6 +49,7 @@ def clean_year(value: str | None) -> str | None:
 
 
 def shorten_title(title: str, max_chars: int = 80) -> str:
+    title = html.unescape(re.sub(r"<[^>]+>", " ", title))
     words = WORD_RE.findall(ascii_fold(title))
     kept: list[str] = []
     for word in words:
@@ -69,6 +74,8 @@ def clean_token(value: str, max_words: int) -> str:
 
 
 def format_word(word: str) -> str:
+    if len(word) > 1 and word.isupper() and ROMAN_NUMERAL_RE.fullmatch(word):
+        return word
     if len(word) > 1 and word.isupper():
         word = word.lower()
     return word[:1].upper() + word[1:]
